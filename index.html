@@ -11,9 +11,6 @@
       /* Core palette — clean white light */
       --bg:          #f5f6f8;
       --surface:     #ffffff;
-
-
-      
       --surface2:    #f0f2f5;
       --surface3:    #e8eaed;
       --surface4:    #dde0e5;
@@ -1659,9 +1656,9 @@
 <span class="kw">#include</span> &lt;WebServer.h&gt;
 
 WebServer server(<span class="num">80</span>);
-<span class="kw">const char</span>* ssid     = <span class="str">"BYD_AC_CONTROLLER"</span>;
+<span class="kw">const char</span>* ssid     = <span class="str">"BYD-AC-ESP32"</span>;
 <span class="kw">const char</span>* password = <span class="str">"12345678"</span>;
-<span class="kw">const int</span>   VALVE_PINS[<span class="num">6</span>] = {<span class="num">12, 13, 14, 25, 26, 27</span>};
+<span class="kw">const int</span>   VALVE_PINS[<span class="num">6</span>] = {<span class="num">1, 2, 41, 42, 45, 46</span>};
 
 <span class="kw">void</span> <span class="fn">setup</span>() {
   <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">6</span>; i++) { pinMode(VALVE_PINS[i], OUTPUT); digitalWrite(VALVE_PINS[i], LOW); }
@@ -1700,7 +1697,9 @@ WebServer server(<span class="num">80</span>);
    SHARED STATE
 ══════════════════════════════════════ */
 const NUM_VALVES = 6;
-let currentValve=0,running=false,timer=null,totalRuntime=0,esp32ip='192.168.4.1';
+const ESP32_WIFI_SSID = 'BYD-AC-ESP32';
+const DEFAULT_ESP32_IP = '192.168.4.1';
+let currentValve=0,running=false,timer=null,totalRuntime=0,esp32ip=DEFAULT_ESP32_IP;
 let manualValveEnabled=Array(NUM_VALVES).fill(false),manualValveActive=Array(NUM_VALVES).fill(false);
 let manualValveDuration=Array(NUM_VALVES).fill(10),manualValveInterval=Array(NUM_VALVES).fill(2);
 let manualRuntime=0,manualRuntimeTimer=null;
@@ -1746,6 +1745,57 @@ function _alog(id,msg,t){
   el.innerHTML=`<span class="${cls}">[${new Date().toLocaleTimeString()}] ${msg}</span><br>`+el.innerHTML;
 }
 
+function normalizeEspIp(value){
+  return (value || DEFAULT_ESP32_IP).trim().replace(/^https?:\/\//,'').replace(/\/.*$/,'') || DEFAULT_ESP32_IP;
+}
+function syncEspIp(value){
+  esp32ip=normalizeEspIp(value);
+  ['espip','espip2','espip3'].forEach(id=>{const el=document.getElementById(id);if(el)el.value=esp32ip;});
+  return esp32ip;
+}
+function setEspConnection(ok,msg,statusId){
+  const ids=statusId?[statusId]:['connectionStatus','connectionStatus2','connectionStatus3'];
+  ids.forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.innerHTML=`<div class="spill-dot ${ok?'on':'err'}"></div><span>${msg}</span>`;
+  });
+  const dot=document.getElementById('connDotGlobal');
+  if(dot){dot.classList.toggle('on',ok);dot.classList.toggle('err',!ok);}
+  const label=document.getElementById('connLabelGlobal');
+  if(label) label.innerText=ok?`WiFi: ${esp32ip}`:`Offline: ${esp32ip}`;
+}
+async function connectToEsp32(ip,statusId,logger){
+  syncEspIp(ip);
+  setEspConnection(false,`Checking ${esp32ip}...`,statusId);
+  try{
+    const r=await fetch(`http://${esp32ip}/status`,{cache:'no-store'});
+    const txt=await r.text();
+    if(!r.ok) throw new Error(txt || r.statusText);
+    setEspConnection(true,`Online — ${esp32ip}`,statusId);
+    logger(`ESP32 online @ ${esp32ip} | WiFi ${ESP32_WIFI_SSID}`,'ok');
+    logger(`Status: ${txt}`,'blue');
+    return true;
+  }catch(e){
+    setEspConnection(false,`Offline — connect WiFi to ${ESP32_WIFI_SSID}`,statusId);
+    logger(`Cannot reach ESP32 @ ${esp32ip}. Connect WiFi to ${ESP32_WIFI_SSID} first.`,'err');
+    return false;
+  }
+}
+async function espRequest(cmd,logger){
+  try{
+    const r=await fetch(`http://${esp32ip}/${cmd}`,{cache:'no-store'});
+    const txt=await r.text();
+    if(!r.ok) throw new Error(txt || r.statusText);
+    logger('ESP32: '+txt,'ok');
+    return txt;
+  }catch(e){
+    setEspConnection(false,`Offline — ${esp32ip}`);
+    logger(`ESP32 command failed: ${cmd}`,'err');
+    logger(`Connect WiFi to ${ESP32_WIFI_SSID} and retry.`,'warn');
+    return null;
+  }
+}
+
 /* ══════════════════════════════════════
    AUTO SEQUENCE
 ══════════════════════════════════════ */
@@ -1760,11 +1810,13 @@ function initAutoTable(){
     </tr>`;
   }
 }
-function updateAutoValve(){
+async function updateAutoValve(){
   for(let i=0;i<NUM_VALVES;i++){
     document.getElementById(`v${i}`).classList.remove('on');
     const c=document.getElementById(`c${i}`);c.innerText='—';c.style.color='var(--text3)';
   }
+  const ok=await sendCmd(`valve?id=${currentValve}&state=1`);
+  if(!ok){running=false;clearTimeout(timer);document.getElementById('modeDisplay').innerText='Comm Error';document.getElementById('modeDisplay').style.color='var(--red)';return false;}
   const cur=(Math.random()*1.5+0.5).toFixed(2),vol=(Math.random()*1.5+11.5).toFixed(2);
   document.getElementById(`v${currentValve}`).classList.add('on');
   const cEl=document.getElementById(`c${currentValve}`);cEl.innerText=cur+' A';cEl.style.color='var(--cyan)';
@@ -1774,25 +1826,34 @@ function updateAutoValve(){
   document.getElementById('modeDisplay').innerText='Running';
   document.getElementById('modeDisplay').style.color='var(--cyan)';
   log(`Valve ${currentValve+1} ON | ${vol}V | ${cur}A`,'ok');
+  return true;
 }
-function nextValve(){
+async function nextValve(){
   if(!running) return;
+  await sendCmd(`valve?id=${currentValve}&state=0`);
   for(let i=0;i<NUM_VALVES;i++){document.getElementById(`v${i}`).classList.remove('on');const c=document.getElementById(`c${i}`);c.innerText='—';c.style.color='var(--text3)';}
-  currentValve=(currentValve+1)%NUM_VALVES; updateAutoValve();
-  const dur=parseInt(document.getElementById('duration').value);
+  currentValve=(currentValve+1)%NUM_VALVES;
+  const ok=await updateAutoValve();
+  if(!ok) return;
+  const dur=Math.max(1,parseInt(document.getElementById('duration').value)||10);
   totalRuntime+=dur/60; document.getElementById('runtime').innerHTML=`${totalRuntime.toFixed(2)} <sub>min</sub>`;
   timer=setTimeout(nextValve,dur*1000);
 }
-function connectESP32(){
-  esp32ip=document.getElementById('espip').value;
-  document.getElementById('connectionStatus').innerHTML=`<div class="spill-dot on"></div><span>Connected — ${esp32ip}</span>`;
-  document.getElementById('connDotGlobal').classList.add('on');
-  document.getElementById('connLabelGlobal').innerText='WiFi: '+esp32ip;
-  log('Connected to ESP32 @ '+esp32ip,'ok');
+async function connectESP32(){return connectToEsp32(document.getElementById('espip').value,'connectionStatus',log);}
+async function sendCmd(cmd){return espRequest(cmd,log);}
+async function startSystem(){
+  if(running)return;
+  const dur=Math.max(1,parseInt(document.getElementById('duration').value)||10);
+  document.getElementById('duration').value=dur;
+  running=true;currentValve=0;totalRuntime=0;
+  log('AUTO SEQUENCE STARTED','ok');
+  const startOk=await sendCmd('start');
+  if(!startOk){running=false;return;}
+  const valveOk=await updateAutoValve();
+  if(!valveOk)return;
+  timer=setTimeout(nextValve,dur*1000);
 }
-async function sendCmd(cmd){try{const r=await fetch(`http://${esp32ip}/${cmd}`);log('ESP32: '+await r.text(),'ok');}catch{log('ESP32 comm error','err');}}
-function startSystem(){if(running)return;running=true;currentValve=0;log('AUTO SEQUENCE STARTED','ok');sendCmd('start');updateAutoValve();timer=setTimeout(nextValve,parseInt(document.getElementById('duration').value)*1000);}
-function stopSystem(){running=false;clearTimeout(timer);for(let i=0;i<NUM_VALVES;i++)document.getElementById(`v${i}`).classList.remove('on');document.getElementById('modeDisplay').innerText='Stopped';document.getElementById('modeDisplay').style.color='var(--text3)';document.getElementById('activeValveDisplay').innerText='—';log('System STOP','warn');sendCmd('stop');}
+function stopSystem(){running=false;clearTimeout(timer);for(let i=0;i<NUM_VALVES;i++){document.getElementById(`v${i}`).classList.remove('on');const c=document.getElementById(`c${i}`);if(c){c.innerText='—';c.style.color='var(--text3)';}}document.getElementById('totalCurrent').innerHTML='0.0 <sub>A</sub>';document.getElementById('modeDisplay').innerText='Stopped';document.getElementById('modeDisplay').style.color='var(--text3)';document.getElementById('activeValveDisplay').innerText='—';log('System STOP','warn');sendCmd('stop');}
 function emergencyStop(){stopSystem();manualStopAll();flowStop();log('!!! EMERGENCY STOP !!!','err');logM('!!! EMERGENCY STOP !!!','err');logF('!!! EMERGENCY STOP !!!','err');sendCmd('emergency');alert('⚠ Emergency Stop Activated');}
 
 /* ══════════════════════════════════════
@@ -1846,7 +1907,7 @@ function initManualGrid(){
   }
 }
 function manualToggleEnable(i){manualValveEnabled[i]=document.getElementById(`mvEnable${i}`).checked;document.getElementById(`mvc${i}`).classList.toggle('is-enabled',manualValveEnabled[i]);if(!manualValveEnabled[i]&&manualValveActive[i])manualSetValveLive(i,false);logM(`Valve ${i+1} ${manualValveEnabled[i]?'ENABLED':'DISABLED'}`,manualValveEnabled[i]?'ok':'');updateManualLiveTable();}
-async function sendCmdM(cmd){try{const r=await fetch(`http://${esp32ip}/${cmd}`);logM('ESP32: '+await r.text(),'ok');}catch{logM('ESP32 comm (sim)','err');}}
+async function sendCmdM(cmd){return espRequest(cmd,logM);}
 function manualSetValveLive(i,on){
   manualValveActive[i]=on;
   const st=document.getElementById(`mvStatus${i}`);
@@ -1884,7 +1945,7 @@ function manualRunCycle(){
 function manualStopCycle(){cycleRunning=false;clearTimeout(cycleTimer);manualDeactivateAll();setCycleStatus('Stopped','var(--text3)');logM('Cycle STOPPED','warn');}
 function setCycleStatus(txt,col){['manualCycleStatus','mlvSumStatus'].forEach(id=>{const el=document.getElementById(id);if(el){el.innerText=txt;el.style.color=col;}});}
 function manualStopAll(){cycleRunning=false;clearTimeout(cycleTimer);manualDeactivateAll();}
-function connectESP32Manual(){esp32ip=document.getElementById('espip2').value;document.getElementById('connectionStatus2').innerHTML=`<div class="spill-dot on"></div><span>Connected — ${esp32ip}</span>`;document.getElementById('connDotGlobal').classList.add('on');document.getElementById('connLabelGlobal').innerText='WiFi: '+esp32ip;logM('Connected to ESP32 @ '+esp32ip,'ok');}
+async function connectESP32Manual(){return connectToEsp32(document.getElementById('espip2').value,'connectionStatus2',logM);}
 
 function initManualLiveTable(){
   const tb=document.getElementById('manualLiveBody');tb.innerHTML='';
@@ -1927,13 +1988,7 @@ setInterval(updateManualLiveTable,500);
 /* ══════════════════════════════════════
    SMART FLOW SEQUENCE
 ══════════════════════════════════════ */
-function connectESP32Flow(){
-  esp32ip=document.getElementById('espip3').value;
-  document.getElementById('connectionStatus3').innerHTML=`<div class="spill-dot on"></div><span>Connected — ${esp32ip}</span>`;
-  document.getElementById('connDotGlobal').classList.add('on');
-  document.getElementById('connLabelGlobal').innerText='WiFi: '+esp32ip;
-  logF('Connected to ESP32 @ '+esp32ip,'ok');
-}
+async function connectESP32Flow(){return connectToEsp32(document.getElementById('espip3').value,'connectionStatus3',logF);}
 
 function selectFlowMode(m){
   currentFlowMode=m;
@@ -1978,7 +2033,7 @@ function toggleOilPath(el){
   chk.innerText=el.classList.contains('selected')?'✓':'';
 }
 
-async function sendCmdFlow(cmd){try{const r=await fetch(`http://${esp32ip}/${cmd}`);logF('ESP32: '+await r.text(),'ok');}catch{logF('Comm (sim)','err');}}
+async function sendCmdFlow(cmd){return espRequest(cmd,logF);}
 
 function setFlowStatus(n,txt,run=false){
   const dot=document.getElementById('fsd'+n);const ftxt=document.getElementById('fst'+n);
